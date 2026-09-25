@@ -1,0 +1,19 @@
+[Unit]
+Description=ShopFlow API (middle tier)
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shopflow
+WorkingDirectory=/opt/shopflow/middle
+EnvironmentFile=/opt/shopflow/middle/middle.env
+Environment=SHOPFLOW_APP_NAME=shopflow-api
+ExecStart=/opt/shopflow/venv/bin/gunicorn -c gunicorn_conf.py app:app
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=ShopFlow traffic generator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shopflow
+WorkingDirectory=/opt/shopflow/loadgen
+EnvironmentFile=/opt/shopflow/loadgen/loadgen.env
+ExecStart=/opt/shopflow/venv/bin/python3 /opt/shopflow/loadgen/loadgen.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

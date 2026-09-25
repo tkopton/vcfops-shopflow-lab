@@ -1,0 +1,19 @@
+[Unit]
+Description=ShopFlow order-processing worker (middle tier)
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shopflow
+WorkingDirectory=/opt/shopflow/middle
+EnvironmentFile=/opt/shopflow/middle/middle.env
+Environment=SHOPFLOW_APP_NAME=shopflow-worker
+ExecStart=/opt/shopflow/venv/bin/python3 /opt/shopflow/middle/worker.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
