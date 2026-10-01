@@ -9,6 +9,12 @@ User=shopflow
 WorkingDirectory=/opt/shopflow/middle
 EnvironmentFile=/opt/shopflow/middle/middle.env
 Environment=SHOPFLOW_APP_NAME=shopflow-api
+# Deliberately small and fixed here (overriding middle.env) -- the API
+# never needs many simultaneous connections, and keeping it small and
+# separate from the worker's pool is what lets Postgres-level exhaustion
+# (caused by the worker leaking connections) actually reach and affect
+# the API/frontend instead of being masked by an oversized shared pool.
+Environment=SHOPFLOW_DB_POOL_MAX=8
 ExecStart=/opt/shopflow/venv/bin/gunicorn -c gunicorn_conf.py app:app
 Restart=always
 RestartSec=3

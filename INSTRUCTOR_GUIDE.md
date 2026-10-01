@@ -1,149 +1,164 @@
 # Instructor guide — ShopFlow VCF Operations troubleshooting lab
 
-Answer key. Don't hand this to trainees (or at least not before the
-exercise) — everything else in the repo is safe for them to see,
-including the source code, if you want a "code review" phase after the
-metrics-based investigation.
+Answer key. Don't hand this to trainees before the exercise — everything
+else in the repo (including the source code) is safe for them to see.
 
-## 1. The headline symptom (what trainees will actually observe)
+## TL;DR
 
-Every ~12-15 minutes (with default tunables — see §5), the storefront
-degrades and then recovers on its own:
+There's a bug in the middle tier (`vcf-middle01`'s order-processing
+worker) that leaks a database connection every time it processes a
+specific kind of order. Over roughly 12-15 minutes of normal traffic,
+enough connections leak that Postgres runs out of connections entirely,
+which starves the API process too — checkout (and sometimes catalog
+browsing) starts failing or timing out. It partially recovers on its own
+after about 15 minutes (a safety-net Postgres setting kills the stuck
+connections), but the worker process itself needs a manual restart to
+actually resume processing orders again.
 
-- Checkout and catalog requests get progressively slower.
-- nginx on `vcf-frontend01` starts returning 504s.
-- The Redis-backed order queue on `vcf-middle01` backs up.
-- Then, over roughly a minute, it clears and everything returns to
-  normal — until it happens again.
+For a troubleshooting exercise, "there's a software bug leaking database
+connections somewhere in the middle tier" is a perfectly good stopping
+point. The full mechanism (§5) is there if you want to go deeper with an
+advanced group, but isn't required to run the exercise.
 
-This "it fixes itself" behavior is a deliberate design choice: it lets
-you run the exercise more than once in a session without a manual reset,
-and it's realistic (a lot of real leaks get masked by exactly this kind
-of timeout-based band-aid, which is itself a clue worth surfacing).
+## 1. How you'll notice something's wrong
 
-## 2. Root cause
+- **Synthetic/external monitoring** (see §2) on the checkout endpoint
+  starts returning 5xx or timing out.
+- A VCF Operations alert on the frontend or middle-tier VM fires (5xx
+  rate, or a connection-count threshold on the DB if you've set one up).
+- Manually: `curl http://<frontend>/api/checkout -X POST ...` (see §2
+  for the body) starts hanging or erroring.
+
+## 2. Synthetic / external monitoring — what to actually probe
+
+If you're polling the frontend externally (e.g. a VCF Operations
+synthetic/URL check, or your own cron+curl), there's an important
+asymmetry between the endpoints:
+
+- **`GET /api/catalog/products` and `GET /api/catalog/featured` are
+  cached in Redis.** During the incident, these can keep returning a
+  perfectly healthy `200` if the cache hasn't expired yet — they're
+  reading stale-but-fine cached data, not hitting the struggling
+  database. Don't rely on these alone to catch the problem; they're not
+  dishonest, they're just answering from cache, which is realistic
+  (and a good discussion point about why monitoring only the cached path
+  can hide a real backend problem).
+- **`POST /api/checkout` always touches the database** — it looks up the
+  current price and inserts a new order row, with nothing cached in
+  front of it. This is the one that will reliably show the problem.
+
+POST body for a synthetic checkout check:
+
+```json
+{"customer_id": 1, "product_id": 1, "quantity": 1, "promo_code": null}
+```
+
+Use a `product_id` between 1 and 12 (the non-clearance catalog items)
+and leave `promo_code` as `null` — this keeps your synthetic probe a
+passive health check that never itself triggers the bug (the loadgen's
+own organic traffic is what does that). A healthy response is `202` with
+a JSON body like `{"order_id": ..., "status": "PENDING"}`; during the
+incident expect `500`, `502`/`504` from nginx, or a timeout, depending on
+exactly where in the chain things are stuck.
+
+**On polling interval:** the incident window is on the order of a
+minute or two once it starts (see §6 for timing), so a 5-minute synthetic
+check interval might occasionally straddle right past it. If you want to
+reliably catch it for a demo, either shorten the check interval, or
+lengthen `idle_in_transaction_session_timeout` in `db/README.md` so the
+degraded window lasts longer.
+
+## 3. What to look at in VCF Operations
+
+You don't need the custom per-process Postgres query from
+`monitoring/telegraf-db.conf` to run this exercise — if you already have
+a built-in/management-pack PostgreSQL integration collecting standard
+metrics, that's enough:
+
+- **`numbackends`** (or your management pack's equivalent "active
+  connections" metric) on vcf-db01 climbing toward `max_connections`
+  (40) over several minutes, then dropping — that's the signal.
+- **CPU/memory on vcf-middle01 and vcf-frontend01 stay unremarkable**
+  through the whole incident — worth checking and ruling out, since it's
+  what trainees will naturally suspect first ("the app server must be
+  overloaded"). It isn't; nothing here is CPU-bound.
+- **Real-time metrics** (VCF Operations 9.1, 2-60s collection) make the
+  climb-then-drop pattern obvious; at the default 5-minute rollup it can
+  look like unremarkable noise around a stable average.
+
+The custom `application_name`-tagged idle-in-transaction query in
+`telegraf-db.conf` is a nice-to-have that tells you *which process*
+(API vs. worker) is holding the connections, via `pg_stat_activity`. If
+it's not picking up in your VCF Operations build, don't spend time
+debugging it for this exercise — `numbackends` alone is enough to
+support the "it's a connection problem on the DB, caused by something in
+the middle tier" conclusion. (If you do want it working: the likely
+culprit is that product-managed Telegraf agents in VCF Operations may
+only support metrics added through the UI's service wizard rather than
+arbitrary custom `[[inputs.postgresql_extensible]]` blocks dropped into
+a conf file — check your build's docs for whether/how it accepts a raw
+Telegraf config snippet versus requiring the service to be added through
+the UI.)
+
+## 4. The troubleshooting path (step by step)
+
+1. Notice the alert or synthetic-check failure on checkout.
+2. Check vcf-middle01 and vcf-frontend01 CPU/memory — both normal. Rules
+   out "just overloaded."
+3. Check vcf-frontend01's nginx metrics — elevated 5xx/504, lagging the
+   real cause by roughly nginx's proxy timeout window.
+4. Check vcf-db01's connection count (`numbackends`) — climbing toward
+   `max_connections`.
+5. Conclusion: the database is running out of connections, not because
+   of query load (CPU/memory on the DB are fine too), but because
+   something is opening connections and not closing them. That something
+   is upstream, in the middle tier — a software bug, not a capacity
+   problem. That's the intended takeaway.
+6. Recovery: checkout should start working again on its own once
+   `idle_in_transaction_session_timeout` frees the stuck connections
+   (watch `numbackends` drop). Separately, restart the worker so it
+   actually resumes processing orders:
+   ```bash
+   sudo systemctl restart shopflow-worker
+   ```
+   Orders placed during the incident will stay at `status='PENDING'`
+   until this runs — a good way to show trainees that "the frontend
+   looks fine again" isn't the same as "the problem is actually fixed."
+
+## 5. Full root cause (optional — for advanced trainees or your own background)
 
 `middle/worker.py`'s `compute_effective_unit_price()` applies promo
 discounts by computing how many units in an order are "free" and
-dividing the subtotal across the remaining "billable" units. Two of the
-three promo codes (`FLASH2026`, `PAIR2026`) always leave at least one
-billable unit. The third, `CLEAROUT` (a clearance/final-markdown code,
-meant to comp the *entire* line), sets `free_units = quantity` — so
-`billable_units` is always `0`, and the division always raises
-`ZeroDivisionError`.
+dividing the subtotal across the remaining "billable" units. The
+`CLEAROUT` promo code (a clearance/final-markdown code meant to comp the
+*entire* line) sets `free_units = quantity`, so `billable_units` is
+always `0` and the division always raises `ZeroDivisionError`.
 
 `process_order()` checks a connection out of the worker's DB pool
-manually (rather than through the context-managed helper the API
-process uses) so a single connection/transaction can span the order
-lookup, the discount calculation, and the final write — avoiding extra
-pool round-trips. It never wraps that in `try/finally`. The `SELECT ...
-FOR UPDATE` before the discount calculation has already opened a
-transaction; when the `ZeroDivisionError` fires, the function exits
-without `COMMIT`, `ROLLBACK`, or returning the connection to the pool.
-The outer loop in `main()` catches the exception broadly (so one bad
-order can't crash the whole worker process — itself a defensible,
-common pattern) and just logs it.
+manually (rather than through the context-managed helper the API process
+uses), to let a single connection/transaction span the order lookup, the
+discount calculation, and the final write. It never wraps this in
+`try/finally`. When the `ZeroDivisionError` fires — after the row lock is
+taken but before `COMMIT`/`ROLLBACK` — the function exits without
+releasing the connection. The outer loop catches the exception broadly
+(so one bad order can't crash the whole worker) and just logs it.
 
-Net effect: every `CLEAROUT` order permanently consumes one Postgres
-backend, sitting in `idle in transaction`, until either the worker
-process restarts or `idle_in_transaction_session_timeout` reaps it.
-`CLEAROUT` orders occur at a low, roughly steady rate as part of normal
-simulated traffic (not a fixed timer — see `loadgen.py`), so the pool
-drains slowly and predictably.
+Net effect: every `CLEAROUT` order permanently leaks one Postgres
+connection (`idle in transaction`) for the life of the worker process.
+`CLEAROUT` orders occur at a low, steady rate as part of normal simulated
+traffic (not a fixed timer — see `loadgen/loadgen.py`), so the problem
+builds slowly and predictably rather than failing immediately — which is
+what makes it non-obvious: nothing about the failure looks like a
+resource leak from the outside, and the API process's own connections
+stay completely healthy throughout (different process, different pool).
 
-**Why it's non-obvious:** nothing about the failure looks like a
-resource leak from the outside. The API process's own pool stays
-healthy the whole time — the bug is entirely in the worker process, a
-separate process on the *same* VM as the API, one hop removed from
-where trainees will naturally look first (the tier serving user-facing
-errors). The exception is caught and logged, not crashing anything, so
-there's no obvious stack trace pointing at "unreleased connection" —
-just a rising count of a specific promo code's orders never reaching
-`INVOICED` status.
+There's also a smaller, independent contributing issue: `middle/app.py`'s
+`FEATURED_TTL = 8` (seconds) causes a small cache-stampede every 8
+seconds under load — a much faster, smaller-amplitude pattern than the
+connection leak, worth noticing as a separate thing if trainees go
+looking at DB query rate.
 
-Because the API and worker are separate OS processes on vcf-middle01,
-each with its own DB connection pool and its own `application_name` tag
-(`shopflow-api` / `shopflow-worker` — see `common/dbutil.py`), trainees
-can tell them apart in `pg_stat_activity` even though VCF Operations
-only sees one VM. This is deliberate: it's a realistic stand-in for "two
-services co-located on one host," which is common enough in smaller
-environments that trainees should get comfortable separating them by
-something other than which VM they're on.
-
-## 3. The contributing issue: cache stampede
-
-`middle/app.py`'s `FEATURED_TTL = 8` (seconds) backs the "trending now"
-panel, hit on nearly every page load. Every 8 seconds under constant
-load, the cache entry expires and every concurrently-inflight request
-misses at once, recomputing the `trending_products` aggregate directly
-against `vcf-db01` (no single-flight/locking). This shows up as a small,
-very regular ~8-second-period blip in DB query rate and Redis miss rate
-— much higher frequency and much smaller amplitude than the
-connection-leak cycle. Trainees who look only at "DB is busy" without
-separating frequency bands may initially conflate this with the main
-incident. It's real, worth flagging, and independently fixable (raise
-the TTL, add a stampede lock) — but it doesn't cause the outage by
-itself.
-
-## 4. Suggested troubleshooting path using VCF Operations
-
-A path that uses each of the tools the session is meant to showcase,
-roughly in order of "what a competent trainee should try":
-
-1. **Alert / dashboard triage.** Start from whatever alert or dashboard
-   first flags the incident (frontend 5xx rate, or a generic VM health
-   badge). Confirm user impact and scope (which VMs show anomalies).
-2. **Rule out the obvious.** Check `vcf-middle01`'s CPU and memory —
-   they stay unremarkable through the whole incident. This is the first
-   "wait, it's not actually overloaded" moment: the symptom is
-   real, but it isn't a resource-exhaustion problem at the OS level on
-   the tier serving requests.
-3. **Follow the request downstream.** Check `vcf-frontend01`'s nginx
-   metrics — 5xx/504 timing should lag the real cause by roughly the
-   proxy timeout window, which is a useful clue about where in the chain
-   the actual blocking is happening (something the middle tier is
-   waiting on, not something it's doing).
-4. **Check the DB tier's own view.** `postgresql_numbackends` climbing
-   toward `max_connections`, and — with the custom query from
-   `telegraf-db.conf` wired up — `shopflow_db_idle_in_txn` (tagged by
-   `application_name`) rising specifically for `shopflow-worker`, not
-   `shopflow-api`. This is the "aha" metric: connections aren't just
-   numerous, they're specifically *idle in transaction*, and they belong
-   to one particular process — which rules out both "the DB is just
-   legitimately busy" and "it's the whole middle tier."
-5. **Switch to real-time metrics.** At the default 5-minute collection
-   interval the climb-and-recover cycle (12-15 minutes) is visible but
-   easy to dismiss as noise around a stable average. Re-examine the same
-   window with VCF Operations 9.1 real-time metrics (2-60s collection)
-   and the sawtooth becomes unambiguous. This is the step that
-   specifically exercises the 9.1 feature the session is built around —
-   consider narrating explicitly "notice how different this looks at
-   5-minute vs. real-time resolution."
-6. **Corroborate with flows (if available).** Long-duration established
-   flows `vcf-middle01 -> vcf-db01:5432` that persist for the whole
-   incident, growing in count over time, confirm the same story from a
-   different data source. Separately, the ~8s burst pattern between the
-   same two VMs corroborates the (secondary) cache-stampede finding —
-   distinguishable from the leak by its much shorter flow duration.
-7. **Pin down the trigger.** With the worker process implicated, either
-   check the Redis queue-depth metric (climbs once the pool is
-   saturated and the worker can't keep up) or, if you're doing a
-   code-review phase, have trainees read `middle/worker.py`'s
-   `compute_effective_unit_price()` and `process_order()` to find the
-   missing `try/finally` and the `CLEAROUT` edge case.
-8. **Fix and verify.** The real fix is code (wrap the manual pool
-   checkout in `try/finally`, or better, use the same context-managed
-   pattern as the API process; separately, guard against
-   `billable_units == 0`). As a live demo you can instead show the
-   *mitigation* already in place — `idle_in_transaction_session_timeout`
-   — and discuss why a timeout is a safety net, not a fix.
-
-## 5. Timing / tuning math
-
-Connection-leak cycle length depends on three things: how often
-`CLEAROUT` checkouts occur, how much headroom exists in
-`max_connections` above baseline usage, and
-`idle_in_transaction_session_timeout`.
+## 6. Timing / tuning math
 
 ```
 total_checkouts_per_min ≈ SHOPFLOW_VUSERS / SHOPFLOW_CHECKOUT_EVERY_S * 60
@@ -153,55 +168,34 @@ minutes_to_exhaustion   ≈ (max_connections - baseline_connections_in_use) / cl
 
 Defaults (`SHOPFLOW_VUSERS=15`, `SHOPFLOW_CHECKOUT_EVERY_S=5`,
 `SHOPFLOW_CLEAROUT_WEIGHT=0.02`) give ≈3.6 leaks/min. With
-`max_connections=40` and typical baseline usage of roughly 5-10
-connections (one API pool + one worker pool, both on a single VM now —
-less baseline overhead than a multi-VM layout) under this load, expect
-first exhaustion somewhere around 8-14 minutes after startup — actual
-numbers depend on your lab's hardware/network latency, so **do a dry
-run** and watch:
+`max_connections=40` and baseline usage of roughly 2-8 connections (the
+API's pool, capped at 8 — see `shopflow-api.service`), expect first
+exhaustion somewhere around 9-13 minutes after startup. Actual numbers
+depend on your lab's hardware/network latency, so **do a dry run** and
+watch:
 
 ```sql
-SELECT application_name, count(*)
-FROM pg_stat_activity
-WHERE state = 'idle in transaction'
-GROUP BY application_name;
+SELECT count(*) FROM pg_stat_activity WHERE state = 'idle in transaction';
 ```
 
-on `vcf-db01` to calibrate before class. To lengthen the cycle for a
-longer session, lower `SHOPFLOW_CLEAROUT_WEIGHT` or raise
-`max_connections`; to shorten it, do the opposite.
-`idle_in_transaction_session_timeout` determines how long each cycle's
-"recovery" takes to kick in — set it to somewhat less than your desired
-total cycle length so trainees can watch at least one full
-climb-and-recover during a live segment, or set it long and do the DB
-tier's `pg_terminate_backend` reset from `README.md` on your own cue
-instead of waiting.
+on `vcf-db01` to calibrate before class. To lengthen the cycle, lower
+`SHOPFLOW_CLEAROUT_WEIGHT`; to shorten it, raise it or lower
+`max_connections`. `idle_in_transaction_session_timeout` controls how
+long the degraded window lasts before Postgres self-heals — set it
+comfortably longer than your synthetic check's polling interval (§2) so
+a check is likely to land inside the window.
 
-The cache-stampede rhythm (`SHOPFLOW_FEATURED_TTL`, default 8s) is
-independent of the above and doesn't need retuning unless you want a
-different contrast in frequency between the two seeded issues.
+## 7. Facilitation notes
 
-## 6. Facilitation notes
-
-- Run the whole stack for at least one full cycle before class starts so
-  there's real history in VCF Operations to look at, not just a live
-  feed trainees have to wait on.
-- If a trainee jumps straight to "it's the worker process's connection
-  pool," that's fine — the point of the multi-step path above is to
-  build the skill of correlating signals, not to gatekeep the answer.
-  Consider asking them to also find the cache-stampede issue and
-  articulate why it's a separate problem, so the exercise still covers
-  the intended breadth.
-- Good discussion prompts: "why does this recover on its own?", "how
-  would you tell a genuine capacity problem from a leak using only
-  `pg_stat_activity`?", "the API and worker run on the same VM — how did
-  you tell which one was responsible without a per-process metric?",
-  "what would you alert on to catch this before users notice?", "what's
-  the actual code fix, and why didn't the broad `except Exception` catch
-  it?"
-- Want more complexity later? A natural extension is splitting the
-  middle tier back into a separate app VM and worker VM (or adding a
-  second, unrelated VM on the same host/cluster as the DB that
-  periodically burns CPU) to reintroduce a genuine "which tier, which
-  VM" ambiguity — straightforward to bolt back on once this simpler
-  version is comfortable for your audience.
+- Run the stack for at least one full cycle before class so there's real
+  history in VCF Operations to look at, not just a live feed trainees
+  have to wait on.
+- Good discussion prompts: "why did checkout recover but orders are
+  still stuck?", "why didn't the catalog page show anything wrong?",
+  "how would you alert on this before users notice?", "what's the actual
+  code fix?"
+- Want more complexity later? Splitting the middle tier back into
+  separate app/worker VMs, or adding an unrelated VM on the DB's host
+  that periodically burns CPU as a red herring, are both straightforward
+  to bolt back on once this simpler version is comfortable for your
+  audience.

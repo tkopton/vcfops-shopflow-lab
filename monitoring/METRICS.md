@@ -65,13 +65,22 @@ Everything below comes from services that already report it natively —
 nothing was added to the application to make this visible.
 
 **PostgreSQL (vcf-db01)** — the core signal:
-- `postgresql_numbackends` climbing toward `max_connections` over
-  10-15 minutes, then dropping sharply.
-- The custom query in `telegraf-db.conf`
-  (`shopflow_db_idle_in_txn.idle_in_txn_count`) — the direct fingerprint
-  of the leak: sessions sitting `idle in transaction`, not just "busy."
-  This is what separates "the DB is legitimately under load" from "the
-  DB is quietly running out of connections."
+- `postgresql_numbackends` (or your PostgreSQL management pack's
+  equivalent "active connections" metric) climbing toward
+  `max_connections` over 10-15 minutes, then dropping sharply. **This
+  alone is enough** to support "the DB is running out of connections" —
+  if you already have a standard PostgreSQL integration collecting this,
+  you don't need anything else from this file to run the exercise.
+- *Optional, nice-to-have:* the custom query in `telegraf-db.conf`
+  (`shopflow_db_idle_in_txn.idle_in_txn_count`) adds the finer-grained
+  fingerprint — sessions specifically sitting `idle in transaction`
+  (not just busy), broken down by which process (`application_name`)
+  owns them. If this custom query doesn't pick up in your VCF Operations
+  build, don't spend time on it — product-managed Telegraf agents
+  sometimes only support services added through the UI's wizard rather
+  than an arbitrary dropped-in conf snippet. `numbackends` alone is
+  sufficient for "there's a connection problem on the DB, caused by
+  something in the middle tier."
 - `pg_stat_activity` itself (see `db/README.md`) if trainees get
   interactive DB access during the exercise.
 
@@ -95,11 +104,26 @@ nothing was added to the application to make this visible.
   whole incident — a useful negative result that rules out "the app
   server is just overloaded" as an explanation.
 
-## 5. Suggested super metrics / alert definitions
+## 5. Synthetic / external monitoring
 
-Build these once the metrics above are flowing:
+If you're also polling the frontend externally (a VCF Operations
+synthetic/URL check, or your own cron+curl), see
+`INSTRUCTOR_GUIDE.md` §2 for the exact `POST /api/checkout` body to use
+and why the two `GET /api/catalog/...` endpoints are unreliable for
+catching this particular incident (they're Redis-cached, so they can
+keep returning healthy `200`s during a DB outage if the cache hasn't
+expired).
 
-- **Super metric** `shopflow.db.idle_in_txn_ratio` =
+## 6. Suggested super metrics / alert definitions
+
+Build these once the metrics above are flowing. The first one below only
+needs `numbackends`; the second needs the optional custom query from §4.
+
+- **Super metric** `shopflow.db.connection_saturation_pct` =
+  `postgresql_numbackends / max_connections * 100`. Alert (Warning) above
+  60%, (Critical) above 85%. Works with just the standard PostgreSQL
+  integration — no custom query needed.
+- *Optional:* **Super metric** `shopflow.db.idle_in_txn_ratio` =
   `shopflow_db_idle_in_txn.idle_in_txn_count / postgresql_numbackends`.
   Alert (Warning) above 20%, (Critical) above 50%.
 - **Super metric** `shopflow.frontend.error_rate_pct` = 5xx / total
@@ -114,7 +138,7 @@ Build these once the metrics above are flowing:
   growth → DB idle-in-transaction count, so the platform itself proposes
   the causal chain instead of trainees assembling it purely by eye.
 
-## 6. Flows
+## 7. Flows
 
 If your VCF Operations deployment has network flow visibility (NSX
 integration or the built-in application/flow discovery) enabled for

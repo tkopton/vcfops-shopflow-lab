@@ -9,6 +9,13 @@ User=shopflow
 WorkingDirectory=/opt/shopflow/middle
 EnvironmentFile=/opt/shopflow/middle/middle.env
 Environment=SHOPFLOW_APP_NAME=shopflow-worker
+# Deliberately set ABOVE Postgres's max_connections (see db/README.md)
+# so the worker's own local pool is never the limiting factor -- Postgres
+# itself is always what eventually refuses connections. If this were
+# capped low (as it used to be, sharing middle.env's smaller default with
+# the API), the worker would silently stop processing orders on its own
+# before the leak ever got large enough to affect anything else.
+Environment=SHOPFLOW_DB_POOL_MAX=50
 ExecStart=/opt/shopflow/venv/bin/python3 /opt/shopflow/middle/worker.py
 Restart=always
 RestartSec=3

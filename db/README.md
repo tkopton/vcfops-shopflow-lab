@@ -22,13 +22,21 @@
 
    **Why these values matter to the exercise:** the seeded bug in
    `middle/worker.py` leaves a connection open mid-transaction
-   (`idle in transaction`) whenever it processes a `CLEAROUT` order. With
-   `max_connections=40` and the default loadgen settings, the pool fills in
-   roughly 12-15 minutes of normal traffic. `idle_in_transaction_session_timeout`
-   is what eventually reaps the orphaned sessions and gives the environment
-   its "recovers on its own, then breaks again" rhythm — a real setting many
-   real environments configure as a safety net, and itself a clue worth
-   noticing. Tune both to fit your session length; see
+   (`idle in transaction`) whenever it processes a `CLEAROUT` order. The
+   worker's own connection pool is deliberately configured (in
+   `shopflow-worker.service`) with a ceiling *above* `max_connections`, so
+   Postgres itself — not the worker's local pool — is always what
+   eventually refuses new connections. With `max_connections=40` and the
+   default loadgen settings, that takes roughly 12-15 minutes of normal
+   traffic. `idle_in_transaction_session_timeout` is what eventually reaps
+   the orphaned sessions on the Postgres side, which frees up headroom for
+   the API process again — but it does **not** fix the worker's own
+   in-memory pool bookkeeping, which still thinks those connections are
+   checked out. So the practical recovery pattern is: the frontend/checkout
+   path recovers on its own, but the worker needs `systemctl restart
+   shopflow-worker` to resume actually processing orders — any orders
+   placed during the incident stay stuck at `status='PENDING'` until then.
+   Tune the timeout to fit your session length; see
    `../INSTRUCTOR_GUIDE.md` for the full math.
 
 3. Create a read-only monitoring role for Telegraf/VCF Operations
