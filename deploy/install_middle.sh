@@ -23,7 +23,7 @@ cp "$LAB_SRC"/middle/requirements.txt /opt/shopflow/middle/
 
 if [ ! -f /opt/shopflow/middle/middle.env ]; then
     cat > /opt/shopflow/middle/middle.env <<'EOF'
-SHOPFLOW_DB_DSN=host=vcf-db01 dbname=shopflow user=shopflow password=shopflow
+SHOPFLOW_DB_DSN=host=vcf-db01 dbname=shopflow user=shopflow password=shopflow%shopflow%
 SHOPFLOW_DB_POOL_MIN=2
 SHOPFLOW_DB_POOL_MAX=15
 SHOPFLOW_REDIS_HOST=localhost

@@ -17,7 +17,7 @@ def get_pool():
     if _pool is None:
         dsn = os.environ.get(
             "SHOPFLOW_DB_DSN",
-            "host=vcf-db01 dbname=shopflow user=shopflow password=shopflow",
+            "host=vcf-db01 dbname=shopflow user=shopflow password=shopflow%shopflow%",
         )
         # Tag connections by process so pg_stat_activity can tell the API
         # process's connections apart from the worker's, even though both

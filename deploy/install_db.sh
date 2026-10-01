@@ -22,7 +22,7 @@ sudo -u postgres psql -v ON_ERROR_STOP=1 <<SQL
 DO \$\$
 BEGIN
    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'shopflow') THEN
-      CREATE ROLE shopflow WITH LOGIN PASSWORD 'shopflow';
+      CREATE ROLE shopflow WITH LOGIN PASSWORD 'shopflow%shopflow%';
    END IF;
    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'telegraf') THEN
       CREATE ROLE telegraf WITH LOGIN PASSWORD 'telegraf';
@@ -36,7 +36,7 @@ sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = 'shopflow'"
 sudo -u postgres psql -d shopflow -v ON_ERROR_STOP=1 -f "$LAB_SRC/db/schema.sql"
 sudo -u postgres psql -d shopflow -c "GRANT CONNECT ON DATABASE shopflow TO telegraf;"
 
-python3 "$LAB_SRC/db/seed.py" --dsn "host=localhost dbname=shopflow user=shopflow password=shopflow"
+python3 "$LAB_SRC/db/seed.py" --dsn "host=localhost dbname=shopflow user=shopflow password=shopflow%shopflow%"
 
 # Lab-sized connection ceiling + the idle-in-transaction reaper. See
 # db/README.md and INSTRUCTOR_GUIDE.md for the sizing rationale.

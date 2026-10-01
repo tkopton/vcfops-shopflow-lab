@@ -5,7 +5,7 @@ Seed data for the ShopFlow lab database.
 Run once on vcf-db01 (or from any host that can reach it) after schema.sql
 has been applied:
 
-    python3 seed.py --dsn "host=vcf-db01 dbname=shopflow user=shopflow password=shopflow"
+    python3 seed.py --dsn "host=vcf-db01 dbname=shopflow user=shopflow password=shopflow%shopflow%"
 
 Creates a realistic catalog plus the promo codes used by the exercise:
   - FLASH2026   : buy-3-get-1-free style discount (1 free unit per 3 bought)
