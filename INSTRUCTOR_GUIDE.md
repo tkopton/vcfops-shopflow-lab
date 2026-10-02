@@ -20,6 +20,17 @@ a fast, near-complete recovery. The restart doesn't patch the bug,
 though; if CLEAROUT orders keep coming, the restarted worker will start
 leaking again.
 
+> **If you deployed this lab before and the frontend never actually
+> showed 5xx:** that was a real bug in the lab's own design, now fixed.
+> The API used to pool its DB connections; once warmed up, a pooled
+> connection keeps getting reused forever and never needs to ask Postgres
+> for a new one, so it stayed healthy no matter how saturated Postgres
+> got from the worker's leak — checkout just silently kept working. The
+> API now opens and closes a fresh connection per request instead (see
+> §5), which is what actually makes it feel the DB exhaustion. Redeploy
+> `common/dbutil.py`, `middle/app.py`, and `middle/shopflow-api.service`
+> if you're running an older checkout of this repo.
+
 For a troubleshooting exercise, "there's a software bug leaking database
 connections somewhere in the middle tier" is a perfectly good stopping
 point. The full mechanism (§5) is there if you want to go deeper with an
@@ -160,10 +171,25 @@ Net effect: every `CLEAROUT` order permanently leaks one Postgres
 connection (`idle in transaction`) for the life of the worker process.
 `CLEAROUT` orders occur at a low, steady rate as part of normal simulated
 traffic (not a fixed timer — see `loadgen/loadgen.py`), so the problem
-builds slowly and predictably rather than failing immediately — which is
-what makes it non-obvious: nothing about the failure looks like a
-resource leak from the outside, and the API process's own connections
-stay completely healthy throughout (different process, different pool).
+builds slowly and predictably rather than failing immediately.
+
+**Why the API feels it at all:** `middle/app.py`'s `db_conn()` opens a
+brand-new, unpooled connection per request and closes it immediately
+after (`common/dbutil.py`'s `new_connection()`) — on purpose. A pooled
+connection, once established, keeps getting reused forever without ever
+asking Postgres for a new one; Postgres refusing *new* connections
+doesn't revoke ones already open. So a pooled API would, once warmed up
+in the first few seconds of traffic, stay completely healthy for the
+rest of the run no matter how saturated Postgres got from the worker's
+leak — which is exactly what happened in an earlier version of this lab,
+and why checkout never actually failed. Making every API request open a
+fresh connection is what ties its health directly to Postgres's current
+capacity. The worker, by contrast, really does pool (`get_pool()`,
+`ThreadedConnectionPool`) — which is what makes its particular mistake
+(checking a connection out and never returning it) a leak rather than
+just "slow," and is a good discussion point on its own: pooling helps
+performance but can also hide a capacity problem from the pooled
+process's own point of view, for better or worse.
 
 There's also a smaller, independent contributing issue: `middle/app.py`'s
 `FEATURED_TTL = 8` (seconds) causes a small cache-stampede every 8
@@ -181,9 +207,10 @@ minutes_to_exhaustion   ≈ (max_connections - baseline_connections_in_use) / cl
 
 Defaults (`SHOPFLOW_VUSERS=15`, `SHOPFLOW_CHECKOUT_EVERY_S=5`,
 `SHOPFLOW_CLEAROUT_WEIGHT=0.02`) give ≈3.6 leaks/min. With
-`max_connections=40` and baseline usage of roughly 2-8 connections (the
-API's pool, capped at 8 — see `shopflow-api.service`), expect first
-exhaustion somewhere around 9-13 minutes after startup. Actual numbers
+`max_connections=40` and baseline usage near-zero most of the time (the
+API doesn't pool, so its connections open and close within each request
+rather than sitting around — see §5), expect first exhaustion somewhere
+around 9-13 minutes after startup. Actual numbers
 depend on your lab's hardware/network latency, so **do a dry run** and
 watch:
 

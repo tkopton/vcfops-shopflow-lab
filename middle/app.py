@@ -18,6 +18,9 @@ this app does still log (request path + duration, cache hit/miss) is
 plain text to stdout, captured by journald, for the log-reading part of
 an investigation.
 
+DB access here deliberately does NOT use a connection pool -- see
+db_conn() below for why.
+
 Run with gunicorn, see gunicorn_conf.py.
 """
 import contextlib
@@ -31,7 +34,7 @@ import redis
 from flask import Flask, jsonify, request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "common"))
-from dbutil import get_pool  # noqa: E402
+from dbutil import new_connection  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s api %(levelname)s %(message)s")
 log = logging.getLogger("shopflow-api")
@@ -61,14 +64,29 @@ rds = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
 @contextlib.contextmanager
 def db_conn():
-    """Healthy pattern: always returns the connection to the pool, even on
-    error. Contrast with worker.py's manual checkout."""
-    pool = get_pool()
-    conn = pool.getconn()
+    """Deliberately unpooled: opens a brand-new connection and always
+    closes it afterward, never reusing one. That makes every request here
+    a live test of whether Postgres can accept a new connection right
+    now -- which is exactly what the worker's leak eventually makes
+    Postgres refuse to do.
+
+    A pooled API (the first version of this file had one) would, once
+    warmed up, just keep serving fine from its small set of already-open
+    sockets regardless of how saturated Postgres gets from the worker's
+    side -- Postgres refusing *new* connections doesn't revoke ones
+    already established. That's realistic for some real apps, but for
+    this exercise it means checkout would stay healthy throughout the
+    incident and the frontend symptom this lab is built around would
+    never actually appear. See common/dbutil.py's new_connection().
+
+    This is a design choice, not a bug -- contrast with worker.py's
+    process_order(), which checks a connection out of a real pool and
+    (via the seeded bug) never returns it."""
+    conn = new_connection()
     try:
         yield conn
     finally:
-        pool.putconn(conn)
+        conn.close()
 
 
 @app.before_request

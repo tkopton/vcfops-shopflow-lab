@@ -26,9 +26,19 @@
    worker's own connection pool is deliberately configured (in
    `shopflow-worker.service`) with a ceiling *above* `max_connections`, so
    Postgres itself — not the worker's local pool — is always what
-   eventually refuses new connections. With `max_connections=40` and the
-   default loadgen settings, that takes roughly 9-13 minutes of normal
-   traffic.
+   eventually refuses new connections. The API, meanwhile, doesn't pool
+   connections at all (see `common/dbutil.py`'s `new_connection()`) — it
+   opens one per request and closes it immediately after, specifically so
+   it keeps needing *new* connections from Postgres rather than quietly
+   reusing a small set of already-open ones that would stay healthy
+   regardless of what the worker is doing. (An earlier version of this
+   lab pooled the API too; once warmed, it never needed a new connection
+   again, so checkout never actually failed during the incident — the
+   frontend symptom the whole exercise is built around just didn't show
+   up.) Baseline Postgres connection usage is therefore near-zero most of
+   the time rather than a flat handful. With `max_connections=40` and the
+   default loadgen settings, exhaustion takes roughly 9-13 minutes of
+   normal traffic.
 
    `idle_in_transaction_session_timeout` eventually reaps each orphaned
    session, but at the default leak rate this is **not** a working
