@@ -16,6 +16,13 @@ Environment=SHOPFLOW_APP_NAME=shopflow-worker
 # the API), the worker would silently stop processing orders on its own
 # before the leak ever got large enough to affect anything else.
 Environment=SHOPFLOW_DB_POOL_MAX=50
+# Optional: forward order-processing failures to a syslog server.
+# Uncomment and point at your collector to see ORDER_FAILED events
+# there (see middle/worker.py). Leave commented out for local-only
+# logging (stdout -> journald, the default).
+#Environment=SHOPFLOW_SYSLOG_HOST=your-syslog-server
+#Environment=SHOPFLOW_SYSLOG_PORT=514
+#Environment=SHOPFLOW_SYSLOG_PROTO=udp
 ExecStart=/opt/shopflow/venv/bin/python3 /opt/shopflow/middle/worker.py
 Restart=always
 RestartSec=3

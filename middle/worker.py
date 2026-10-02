@@ -14,7 +14,9 @@ work with, which is the point of the exercise.
 """
 import json
 import logging
+import logging.handlers
 import os
+import socket
 import sys
 import time
 
@@ -29,6 +31,31 @@ log = logging.getLogger("shopflow-worker")
 REDIS_HOST = os.environ.get("SHOPFLOW_REDIS_HOST", "localhost")
 REDIS_PORT = int(os.environ.get("SHOPFLOW_REDIS_PORT", "6379"))
 QUEUE_KEY = os.environ.get("SHOPFLOW_QUEUE_KEY", "shopflow:orders")
+
+# --- Optional syslog forwarding for order-processing failures --------
+# Off by default (no application behavior here unless you set the host).
+# This does NOT know about HTTP 5xx responses -- the worker never sees
+# those, that's an nginx/API-tier concept. What it forwards is the
+# order-processing failure that is the actual root cause of the 5xx a
+# trainee eventually sees on the frontend, a few minutes upstream of it.
+SYSLOG_HOST = os.environ.get("SHOPFLOW_SYSLOG_HOST")
+SYSLOG_PORT = int(os.environ.get("SHOPFLOW_SYSLOG_PORT", "514"))
+SYSLOG_PROTO = os.environ.get("SHOPFLOW_SYSLOG_PROTO", "udp").lower()  # udp or tcp
+
+if SYSLOG_HOST:
+    _socktype = socket.SOCK_STREAM if SYSLOG_PROTO == "tcp" else socket.SOCK_DGRAM
+    _syslog_handler = logging.handlers.SysLogHandler(
+        address=(SYSLOG_HOST, SYSLOG_PORT),
+        facility=logging.handlers.SysLogHandler.LOG_LOCAL0,
+        socktype=_socktype,
+    )
+    _syslog_handler.ident = "shopflow-worker: "
+    # Only failures go to syslog -- the routine "order invoiced" log line
+    # stays local (stdout/journald) so the syslog server isn't flooded.
+    _syslog_handler.setLevel(logging.ERROR)
+    _syslog_handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    log.addHandler(_syslog_handler)
+    log.info("syslog forwarding enabled -> %s:%d/%s", SYSLOG_HOST, SYSLOG_PORT, SYSLOG_PROTO)
 
 r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
@@ -115,8 +142,15 @@ def main():
         except Exception as exc:
             # Catch broadly so one bad order can't take the whole worker
             # process down -- a queue of thousands of orders shouldn't
-            # stall because one of them has bad data.
-            log.error("order %s failed to invoice (promo=%s): %s", job.get("order_id"), job.get("promo_code"), exc)
+            # stall because one of them has bad data. This is also the
+            # one line that reaches syslog (see SHOPFLOW_SYSLOG_HOST
+            # above) -- ORDER_FAILED plus key=value fields so it's easy
+            # to grep/alert on at the syslog server.
+            log.error(
+                "ORDER_FAILED order_id=%s product_id=%s quantity=%s promo_code=%s error=%r",
+                job.get("order_id"), job.get("product_id"), job.get("quantity"),
+                job.get("promo_code"), exc,
+            )
 
 
 if __name__ == "__main__":

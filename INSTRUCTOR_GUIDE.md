@@ -7,13 +7,18 @@ else in the repo (including the source code) is safe for them to see.
 
 There's a bug in the middle tier (`vcf-middle01`'s order-processing
 worker) that leaks a database connection every time it processes a
-specific kind of order. Over roughly 12-15 minutes of normal traffic,
+specific kind of order. Over roughly 9-13 minutes of normal traffic,
 enough connections leak that Postgres runs out of connections entirely,
 which starves the API process too — checkout (and sometimes catalog
-browsing) starts failing or timing out. It partially recovers on its own
-after about 15 minutes (a safety-net Postgres setting kills the stuck
-connections), but the worker process itself needs a manual restart to
-actually resume processing orders again.
+browsing) starts failing or timing out. **It will not clear up on its
+own while traffic keeps flowing** — the default leak rate refills
+freed-up capacity about as fast as Postgres's safety-net timeout frees
+it, so the system just stays stuck (see §6). The actual fix is
+`systemctl restart shopflow-worker`: that closes the worker's old leaked
+sockets immediately, which Postgres notices right away and cleans up —
+a fast, near-complete recovery. The restart doesn't patch the bug,
+though; if CLEAROUT orders keep coming, the restarted worker will start
+leaking again.
 
 For a troubleshooting exercise, "there's a software bug leaking database
 connections somewhere in the middle tier" is a perfectly good stopping
@@ -114,16 +119,24 @@ the UI.)
    something is opening connections and not closing them. That something
    is upstream, in the middle tier — a software bug, not a capacity
    problem. That's the intended takeaway.
-6. Recovery: checkout should start working again on its own once
-   `idle_in_transaction_session_timeout` frees the stuck connections
-   (watch `numbackends` drop). Separately, restart the worker so it
-   actually resumes processing orders:
+6. Recovery: don't just wait it out — at the default traffic rate, new
+   leaks replace reaped ones about as fast as `idle_in_transaction_session_timeout`
+   clears them, so `numbackends` stays pegged near `max_connections`
+   indefinitely rather than draining on its own (see §6 for the math).
+   The fix is restarting the worker:
    ```bash
    sudo systemctl restart shopflow-worker
    ```
+   This is what actually clears the backlog, and fast: killing the old
+   process drops its sockets, Postgres notices immediately and frees
+   those connections right away rather than waiting out the full
+   15-minute timeout. Watch `numbackends` fall right after you run it.
    Orders placed during the incident will stay at `status='PENDING'`
-   until this runs — a good way to show trainees that "the frontend
-   looks fine again" isn't the same as "the problem is actually fixed."
+   even after `numbackends` recovers — a good way to show trainees that
+   "the frontend looks fine again" isn't the same as "the problem is
+   actually fixed." And since the restarted worker is still running the
+   same buggy code, it'll start leaking again if CLEAROUT orders keep
+   coming — this is a reset, not a cure.
 
 ## 5. Full root cause (optional — for advanced trainees or your own background)
 
@@ -180,10 +193,22 @@ SELECT count(*) FROM pg_stat_activity WHERE state = 'idle in transaction';
 
 on `vcf-db01` to calibrate before class. To lengthen the cycle, lower
 `SHOPFLOW_CLEAROUT_WEIGHT`; to shorten it, raise it or lower
-`max_connections`. `idle_in_transaction_session_timeout` controls how
-long the degraded window lasts before Postgres self-heals — set it
-comfortably longer than your synthetic check's polling interval (§2) so
-a check is likely to land inside the window.
+`max_connections`.
+
+**Why it doesn't self-heal:** `idle_in_transaction_session_timeout` reaps
+each leaked connection 15 minutes after it leaked, which sounds like a
+recovery mechanism but isn't one at these defaults. Leak demand over one
+timeout window is `clearout_leaks_per_min * 15 ≈ 3.6 * 15 ≈ 54` —
+more than the ~32-38 connections actually available after baseline
+usage. Once the system first saturates, every connection the timeout
+frees gets immediately reclaimed by the next CLEAROUT order's leak
+attempt, so it stays pegged at `max_connections` continuously rather
+than oscillating back to healthy. Set
+`idle_in_transaction_session_timeout` comfortably longer than your
+synthetic check's polling interval (§2) so a check is likely to land
+inside the (sustained, not transient) degraded window — but don't tell
+trainees to just wait it out; `systemctl restart shopflow-worker` (§4
+step 6) is the actual recovery action.
 
 ## 7. Facilitation notes
 

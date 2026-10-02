@@ -27,17 +27,27 @@
    `shopflow-worker.service`) with a ceiling *above* `max_connections`, so
    Postgres itself — not the worker's local pool — is always what
    eventually refuses new connections. With `max_connections=40` and the
-   default loadgen settings, that takes roughly 12-15 minutes of normal
-   traffic. `idle_in_transaction_session_timeout` is what eventually reaps
-   the orphaned sessions on the Postgres side, which frees up headroom for
-   the API process again — but it does **not** fix the worker's own
-   in-memory pool bookkeeping, which still thinks those connections are
-   checked out. So the practical recovery pattern is: the frontend/checkout
-   path recovers on its own, but the worker needs `systemctl restart
-   shopflow-worker` to resume actually processing orders — any orders
-   placed during the incident stay stuck at `status='PENDING'` until then.
-   Tune the timeout to fit your session length; see
-   `../INSTRUCTOR_GUIDE.md` for the full math.
+   default loadgen settings, that takes roughly 9-13 minutes of normal
+   traffic.
+
+   `idle_in_transaction_session_timeout` eventually reaps each orphaned
+   session, but at the default leak rate this is **not** a working
+   self-heal: new leaks refill freed capacity about as fast as the
+   timeout clears it (leak demand over one 15-minute window is
+   `~3.6/min * 15 ≈ 54`, more than the ~32-38 connections actually
+   available), so once saturated, `numbackends` just stays pegged near
+   `max_connections` rather than recovering. The real fix is
+   `systemctl restart shopflow-worker`: killing the old process drops its
+   leaked sockets immediately, which Postgres notices right away and
+   cleans up — a fast, near-complete recovery, much quicker than waiting
+   out the 15-minute timeout. It's a reset, not a cure, though: the
+   restarted worker runs the same buggy code and will start leaking again
+   if CLEAROUT orders keep coming. Either way, it does **not** fix the
+   worker's own in-memory pool bookkeeping for the connections it already
+   lost, and any orders placed during the incident stay stuck at
+   `status='PENDING'` until the worker is restarted. Tune the timeout to
+   fit your session length; see `../INSTRUCTOR_GUIDE.md` for the full
+   math.
 
 3. Create a read-only monitoring role for Telegraf/VCF Operations
    (see `../monitoring/telegraf-db.conf`):
@@ -77,6 +87,25 @@ ORDER BY age DESC;
 Every row with `application_name = 'shopflow-worker'` and
 `state = 'idle in transaction'` is a leaked connection from a `CLEAROUT`
 order; `shopflow-api` rows should never accumulate like this.
+
+## Optional: forwarding worker failures to syslog
+
+`middle/worker.py` can forward each `ORDER_FAILED` log line (the
+exception raised by the seeded bug) to a syslog server — off by default.
+On `vcf-middle01`, uncomment and set the `SHOPFLOW_SYSLOG_*` lines in
+`shopflow-worker.service`, then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart shopflow-worker
+```
+
+Note this is a precursor signal, not the 5xx itself: the worker never
+sees HTTP status codes (that's nginx/the API's layer), so what lands in
+syslog is the order-processing failure that, a few minutes later, is
+what causes checkout to start returning 5xx once enough of them have
+leaked a connection each. See `monitoring/METRICS.md` for how this fits
+alongside the metrics and synthetic-check signals.
 
 ## Rotating the `shopflow` password on an already-deployed lab
 

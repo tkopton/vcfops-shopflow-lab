@@ -114,6 +114,19 @@ catching this particular incident (they're Redis-cached, so they can
 keep returning healthy `200`s during a DB outage if the cache hasn't
 expired).
 
+## 5a. Optional: syslog from the worker
+
+`middle/worker.py` can forward its `ORDER_FAILED` log line to a syslog
+server, disabled by default (see `db/README.md`'s "Optional: forwarding
+worker failures to syslog" and the commented `SHOPFLOW_SYSLOG_*` lines in
+`shopflow-worker.service`). This is a precursor signal, not the 5xx
+itself — the worker has no concept of HTTP status codes — but it fires
+minutes before checkout starts erroring, since it's logged the moment
+each CLEAROUT order leaks a connection. If your syslog server/VCF
+Operations log ingestion surfaces it, it's a good complement to the
+metrics above: it points straight at the middle tier and at the specific
+order type, which `numbackends` alone can't tell you.
+
 ## 6. Suggested super metrics / alert definitions
 
 Build these once the metrics above are flowing. The first one below only
