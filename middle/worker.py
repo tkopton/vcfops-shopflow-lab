@@ -129,11 +129,29 @@ def process_order(job: dict) -> None:
 def main():
     log.info("worker started, watching queue %r on %s:%d", QUEUE_KEY, REDIS_HOST, REDIS_PORT)
     while True:
-        item = r.blpop(QUEUE_KEY, timeout=5)
+        try:
+            item = r.blpop(QUEUE_KEY, timeout=5)
+        except redis.exceptions.RedisError as exc:
+            # This used to be unguarded, so a transient Redis hiccup could
+            # crash the whole process. With Restart=always in
+            # shopflow-worker.service, systemd would silently bring it
+            # back with a brand-new, empty connection pool -- which drops
+            # all previously-leaked connections for free, independent of
+            # anything a trainee does. That self-resets the exercise
+            # without anyone noticing, so don't let a Redis blip take the
+            # process down: log it and keep polling.
+            log.error("redis error polling queue: %s", exc)
+            time.sleep(2)
+            continue
+
         if item is None:
             continue
         _, payload = item
-        job = json.loads(payload)
+        try:
+            job = json.loads(payload)
+        except (ValueError, TypeError) as exc:
+            log.error("bad queue payload, dropping: %s", exc)
+            continue
 
         start = time.time()
         try:
