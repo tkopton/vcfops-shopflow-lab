@@ -149,6 +149,96 @@ the UI.)
    same buggy code, it'll start leaking again if CLEAROUT orders keep
    coming — this is a reset, not a cure.
 
+## 4a. Optional demo moment: proving Redis and Postgres aren't the problem
+
+Trainees often reflexively blame "the database" or "the cache" by name
+once something's slow, even when the real cause is upstream of both.
+Before landing on step 5's conclusion, it's a strong beat to actively
+rule the two backing services out rather than just assert it. Everything
+below should look boring and healthy throughout the incident — the
+contrast with `numbackends` (the one abnormal number anywhere) is the
+point.
+
+**Postgres (vcf-db01), from Telegraf/VCF Operations (`inputs.postgresql`):**
+- `postgresql_xact_commit` / `postgresql_xact_rollback` — transaction
+  throughput tracks traffic normally, no cliff.
+- `postgresql_blks_hit` vs `postgresql_blks_read` — cache hit ratio stays
+  high throughout; a struggling Postgres would show this degrading.
+- `postgresql_deadlocks`, `postgresql_conflicts` — stay at 0 the whole
+  time. The leak holds a lingering row lock, not a deadlock — nothing
+  else is waiting on that specific row.
+- `postgresql_temp_files` / `postgresql_temp_bytes` — stay at 0; nonzero
+  would mean queries spilling to disk, a genuine capacity symptom this
+  incident doesn't have.
+- CPU/memory/disk I/O on vcf-db01 — flat throughout (already called out
+  in step 2's spirit, just applied to the DB tier too).
+
+Live commands for the demo, on vcf-db01:
+```sql
+-- How many sessions are actually DOING something, vs just sitting?
+SELECT state, count(*) FROM pg_stat_activity GROUP BY state;
+```
+`active` stays tiny the whole time — most rows are `idle` or
+`idle in transaction`. Postgres isn't buried under query load; it's out
+of connection slots, a different problem entirely.
+
+```sql
+-- Is the stuck transaction blocking anything else?
+SELECT pid, wait_event_type, wait_event, query
+FROM pg_stat_activity
+WHERE wait_event_type IS NOT NULL;
+```
+Comes back empty or near-empty — the leaked `FOR UPDATE` lock is scoped
+to one specific order row, not cascading into blocking the rest of the
+app.
+
+```sql
+\timing on
+SELECT unit_price FROM products WHERE product_id = 1;
+```
+Sub-millisecond, every time. The query engine itself is fine — the
+problem is "can I get a connection at all," not "is Postgres slow."
+
+**Redis (vcf-middle01), from Telegraf/VCF Operations (`inputs.redis`):**
+- `redis_used_memory` — flat, nowhere near any configured `maxmemory`.
+- `redis_evicted_keys` — stays 0; no memory pressure.
+- `redis_rejected_connections` — stays 0. Worth saying out loud: this is
+  the same *kind* of metric as Postgres's connection count, and only one
+  of the two services actually has a problem with it.
+- `redis_instantaneous_ops_per_sec` — proportional to load, no cliff.
+- `redis_keyspace_hits` / `redis_keyspace_misses` — the one genuinely
+  "interesting" Redis metric, but it's the cache-stampede side story
+  (§5, `FEATURED_TTL`) — a separate, smaller, faster pattern. Worth
+  explicitly distinguishing so trainees don't conflate the two.
+
+Live commands for the demo, on vcf-middle01:
+```bash
+redis-cli --latency
+```
+Sub-millisecond the whole time — Redis itself is never the slow part.
+
+```bash
+redis-cli INFO clients
+```
+`connected_clients` stays flat and low — a good visual contrast next to
+`numbackends` climbing on the Postgres side.
+
+```bash
+redis-cli LLEN shopflow:orders
+```
+This one *does* climb during the incident — but that's the job queue
+backing up because the worker can't get a DB connection to drain it, not
+because Redis is struggling. It's evidence Redis is a bystander, not a
+cause: it's just patiently holding jobs the worker can't currently
+process.
+
+**The line to say out loud:** every resource and throughput metric on
+both backing services stays normal. The only abnormal number anywhere is
+Postgres's connection count — which argues for "something is holding
+connections open without releasing them" (application code), not
+"infrastructure doesn't have enough capacity." That contrast *is* the
+lesson.
+
 ## 5. Full root cause (optional — for advanced trainees or your own background)
 
 `middle/worker.py`'s `compute_effective_unit_price()` applies promo
